@@ -1,0 +1,13 @@
+[Unit]
+Description=Qt GPIO Demo
+After=dev-spidev0.0.device
+Wants=dev-spidev0.0.device
+
+[Service]
+Environment=MADCTL_VAL=0x88
+Environment=QT_QPA_PLATFORM=offscreen
+ExecStart=/usr/bin/gpio-qt-demo
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

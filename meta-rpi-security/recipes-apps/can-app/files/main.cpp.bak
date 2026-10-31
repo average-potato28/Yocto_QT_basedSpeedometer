@@ -1,0 +1,940 @@
+#include <iostream>
+#include <cstring>
+#include <cstdio>
+#include <cstdint>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <net/if.h>
+
+#include <linux/can.h>
+#include <linux/can/raw.h>
+
+#include "vehicle-data.h"
+
+
+// ============================================================
+// CAN configuration
+// ============================================================
+
+// 1 = fake CAN data
+// 0 = real can0
+#define TESTING_CAN 1
+
+#define CAN_INTERFACE "can0"
+
+
+// ============================================================
+// POSIX Shared Memory
+// ============================================================
+
+#define VEHICLE_SHM_NAME "/vehicle_data"
+
+static int shm_fd = -1;
+
+static VehicleData *sharedVehicleData = nullptr;
+
+
+// ============================================================
+// CAN IDs
+// ============================================================
+
+#define CAN_ID_SPEED       0x100
+#define CAN_ID_BATTERY     0x101
+#define CAN_ID_TEMPERATURE 0x102
+#define CAN_ID_RPM         0x103
+#define CAN_ID_GEAR        0x104
+#define CAN_ID_STATUS      0x105
+
+
+// ============================================================
+// Shared Memory Initialization
+// ============================================================
+
+bool initSharedMemory()
+{
+    std::cout
+        << "Creating shared memory: "
+        << VEHICLE_SHM_NAME
+        << "\n";
+
+
+    // --------------------------------------------------------
+    // Create / open shared memory
+    // --------------------------------------------------------
+
+    shm_fd = shm_open(VEHICLE_SHM_NAME , O_CREAT | O_RDWR , 0666);
+
+
+    if (shm_fd < 0)
+    {
+        perror("shm_open");
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Set shared memory size
+    // --------------------------------------------------------
+
+    if (
+        ftruncate(
+            shm_fd,
+            sizeof(VehicleData)
+        ) < 0
+    )
+    {
+        perror("ftruncate");
+
+        close(shm_fd);
+
+        shm_fd = -1;
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Map shared memory
+    // --------------------------------------------------------
+
+    void *ptr =
+        mmap(
+            nullptr,
+            sizeof(VehicleData),
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            shm_fd,
+            0
+        );
+
+
+    if (ptr == MAP_FAILED)
+    {
+        perror("mmap");
+
+        close(shm_fd);
+
+        shm_fd = -1;
+
+        return false;
+    }
+
+
+    sharedVehicleData =
+        static_cast<VehicleData *>(ptr);
+
+
+    // --------------------------------------------------------
+    // Initialize shared memory
+    // --------------------------------------------------------
+
+    VehicleData initialData{};
+
+    std::memcpy(
+        sharedVehicleData,
+        &initialData,
+        sizeof(VehicleData)
+    );
+
+
+    std::cout
+        << "Shared memory created successfully\n";
+
+    std::cout
+        << "Name: "
+        << VEHICLE_SHM_NAME
+        << "\n";
+
+    std::cout
+        << "Size: "
+        << sizeof(VehicleData)
+        << " bytes\n";
+
+
+    return true;
+}
+
+
+// ============================================================
+// Write VehicleData
+// ============================================================
+
+bool writeVehicleData(
+    const VehicleData &d
+)
+{
+    if (sharedVehicleData == nullptr)
+    {
+        std::cerr
+            << "ERROR: Shared memory is not initialized\n";
+
+        return false;
+    }
+
+
+    std::memcpy(
+        sharedVehicleData,
+        &d,
+        sizeof(VehicleData)
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// Cleanup Shared Memory
+// ============================================================
+
+void cleanupSharedMemory()
+{
+    if (sharedVehicleData != nullptr)
+    {
+        munmap(
+            sharedVehicleData,
+            sizeof(VehicleData)
+        );
+
+        sharedVehicleData = nullptr;
+    }
+
+
+    if (shm_fd >= 0)
+    {
+        close(shm_fd);
+
+        shm_fd = -1;
+    }
+
+
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT call shm_unlink() here.
+     *
+     * The shared-memory object should remain available
+     * so gpio-qt-demo can continue/reconnect.
+     */
+}
+
+
+// ============================================================
+// Print CAN frame
+// ============================================================
+
+void printCanFrame(
+    const struct can_frame &frame
+)
+{
+    std::printf(
+        "CAN ID: 0x%03X DLC: %d DATA:",
+        frame.can_id & CAN_SFF_MASK,
+        frame.can_dlc
+    );
+
+
+    for (
+        int i = 0;
+        i < frame.can_dlc;
+        ++i
+    )
+    {
+        std::printf(
+            " %02X",
+            frame.data[i]
+        );
+    }
+
+
+    std::printf("\n");
+}
+
+
+// ============================================================
+// Decode CAN frame
+// ============================================================
+
+void decodeCanFrame(
+    const struct can_frame &frame,
+    VehicleData &vehicle
+)
+{
+    uint32_t id = frame.can_id & CAN_SFF_MASK;
+
+
+    // ========================================================
+    // SPEED
+    //
+    // ID 0x100
+    //
+    // bytes [0-1] = speed * 100
+    //
+    // Example:
+    // 5234 = 52.34 km/h
+    // ========================================================
+
+    if (id == CAN_ID_SPEED && frame.can_dlc >= 2
+    )
+    {
+        uint16_t rawSpeed =
+            static_cast<uint16_t>(
+                frame.data[0] |
+                (frame.data[1] << 8)
+            );
+
+
+        vehicle.speed =
+            rawSpeed / 100.0f;
+    }
+
+
+    // ========================================================
+    // BATTERY
+    //
+    // ID 0x101
+    //
+    // byte 0    = battery %
+    // bytes 1-2 = voltage * 100
+    // bytes 3-4 = current * 100
+    // ========================================================
+
+    else if (
+        id == CAN_ID_BATTERY &&
+        frame.can_dlc >= 5
+    )
+    {
+        vehicle.batteryPercent =
+            frame.data[0];
+
+
+        uint16_t rawVoltage =
+            static_cast<uint16_t>(
+                frame.data[1] |
+                (frame.data[2] << 8)
+            );
+
+
+        uint16_t rawCurrent =
+            static_cast<uint16_t>(
+                frame.data[3] |
+                (frame.data[4] << 8)
+            );
+
+
+        vehicle.batteryVoltage =
+            rawVoltage / 100.0f;
+
+
+        vehicle.batteryCurrent =
+            rawCurrent / 100.0f;
+    }
+
+
+    // ========================================================
+    // TEMPERATURE
+    //
+    // ID 0x102
+    //
+    // bytes 0-1 = temperature * 100
+    // ========================================================
+
+    else if (
+        id == CAN_ID_TEMPERATURE &&
+        frame.can_dlc >= 2
+    )
+    {
+        int16_t rawTemperature =
+            static_cast<int16_t>(
+                frame.data[0] |
+                (frame.data[1] << 8)
+            );
+
+
+        vehicle.temperature =
+            rawTemperature / 100.0f;
+    }
+
+
+    // ========================================================
+    // RPM
+    //
+    // ID 0x103
+    //
+    // bytes 0-1 = RPM
+    // ========================================================
+
+    else if (
+        id == CAN_ID_RPM &&
+        frame.can_dlc >= 2
+    )
+    {
+        uint16_t rawRPM =
+            static_cast<uint16_t>(
+                frame.data[0] |
+                (frame.data[1] << 8)
+            );
+
+
+        vehicle.rpm =
+            static_cast<float>(rawRPM);
+    }
+
+
+    // ========================================================
+    // GEAR
+    //
+    // ID 0x104
+    //
+    // byte 0 = gear
+    // ========================================================
+
+    else if (
+        id == CAN_ID_GEAR &&
+        frame.can_dlc >= 1
+    )
+    {
+        vehicle.gear =
+            frame.data[0];
+    }
+
+
+    // ========================================================
+    // STATUS
+    //
+    // ID 0x105
+    //
+    // byte 0:
+    //
+    // bit 0 = left indicator
+    // bit 1 = right indicator
+    // bit 2 = high beam
+    // bit 3 = ABS
+    // bit 4 = Bluetooth
+    // ========================================================
+
+    else if (
+        id == CAN_ID_STATUS &&
+        frame.can_dlc >= 1
+    )
+    {
+        uint8_t status =
+            frame.data[0];
+
+
+        vehicle.leftIndicator =
+            status & (1 << 0);
+
+
+        vehicle.rightIndicator =
+            status & (1 << 1);
+
+
+        vehicle.highBeam =
+            status & (1 << 2);
+
+
+        vehicle.abs =
+            status & (1 << 3);
+
+
+        vehicle.bluetooth =
+            status & (1 << 4);
+    }
+
+
+    // ========================================================
+    // Write latest complete vehicle state
+    // ========================================================
+
+    writeVehicleData(vehicle);
+}
+
+
+// ============================================================
+// TEST MODE
+// ============================================================
+
+#if TESTING_CAN
+
+void runTestingCAN()
+{
+    std::cout
+        << "========================================\n"
+        << " CAN APP\n"
+        << " TEST MODE\n"
+        << " TESTING_CAN = 1\n"
+        << "========================================\n";
+
+
+    VehicleData vehicle{};
+
+
+    float speed = 0.0f;
+
+
+    while (true)
+    {
+        // ----------------------------------------------------
+        // SPEED
+        // ----------------------------------------------------
+
+        speed += 2.0f;
+
+
+        if (speed > 160.0f)
+            speed = 0.0f;
+
+
+        vehicle.speed =
+            speed;
+
+
+        // ----------------------------------------------------
+        // RPM
+        // ----------------------------------------------------
+
+        vehicle.rpm =
+            vehicle.speed * 65.0f;
+
+
+        // ----------------------------------------------------
+        // BATTERY
+        // ----------------------------------------------------
+
+        vehicle.batteryPercent =
+            78.0f -
+            (
+                vehicle.speed /
+                160.0f *
+                20.0f
+            );
+
+
+        vehicle.batteryVoltage =
+            12.0f +
+            vehicle.batteryPercent *
+            0.008f;
+
+
+        vehicle.batteryCurrent =
+            2.0f +
+            vehicle.speed *
+            0.04f;
+
+
+        // ----------------------------------------------------
+        // TEMPERATURE
+        // ----------------------------------------------------
+
+        vehicle.temperature =
+            55.0f +
+            vehicle.speed *
+            0.18f;
+
+
+        // ----------------------------------------------------
+        // GEAR
+        // ----------------------------------------------------
+
+        if (vehicle.speed < 5)
+        {
+            vehicle.gear = 0;
+        }
+        else if (vehicle.speed < 20)
+        {
+            vehicle.gear = 1;
+        }
+        else if (vehicle.speed < 40)
+        {
+            vehicle.gear = 2;
+        }
+        else if (vehicle.speed < 65)
+        {
+            vehicle.gear = 3;
+        }
+        else if (vehicle.speed < 90)
+        {
+            vehicle.gear = 4;
+        }
+        else if (vehicle.speed < 120)
+        {
+            vehicle.gear = 5;
+        }
+        else
+        {
+            vehicle.gear = 6;
+        }
+
+
+        // ----------------------------------------------------
+        // TRIP
+        // ----------------------------------------------------
+
+        vehicle.tripA +=
+            vehicle.speed /
+            3600.0f *
+            0.1f;
+
+
+        vehicle.tripB =
+            vehicle.tripA *
+            0.7f;
+
+
+        // ----------------------------------------------------
+        // ODOMETER
+        // ----------------------------------------------------
+
+        vehicle.odometer =
+            1256.0f +
+            vehicle.tripA;
+
+
+        // ----------------------------------------------------
+        // SPEED STATISTICS
+        // ----------------------------------------------------
+
+        vehicle.averageSpeed =
+            vehicle.speed *
+            0.7f;
+
+
+        vehicle.maxSpeed =
+            std::max(
+                vehicle.maxSpeed,
+                vehicle.speed
+            );
+
+
+        // ----------------------------------------------------
+        // RANGE
+        // ----------------------------------------------------
+
+        vehicle.range =
+            vehicle.batteryPercent *
+            1.5f;
+
+
+        // ----------------------------------------------------
+        // INDICATORS
+        // ----------------------------------------------------
+
+        vehicle.leftIndicator =
+            (
+                (
+                    static_cast<int>(speed) /
+                    2
+                ) % 10
+            ) == 0;
+
+
+        vehicle.rightIndicator =
+            false;
+
+
+        // ----------------------------------------------------
+        // HIGH BEAM
+        // ----------------------------------------------------
+
+        vehicle.highBeam =
+            vehicle.speed >
+            110.0f;
+
+
+        // ----------------------------------------------------
+        // ABS
+        // ----------------------------------------------------
+
+        vehicle.abs =
+            true;
+
+
+        // ----------------------------------------------------
+        // BLUETOOTH
+        // ----------------------------------------------------
+
+        vehicle.bluetooth =
+            true;
+
+
+        // ----------------------------------------------------
+        // DRIVE MODE
+        // ----------------------------------------------------
+
+        if (vehicle.speed < 60)
+        {
+            vehicle.driveMode = 0;
+        }
+        else if (vehicle.speed < 110)
+        {
+            vehicle.driveMode = 1;
+        }
+        else
+        {
+            vehicle.driveMode = 2;
+        }
+
+
+        // ----------------------------------------------------
+        // WRITE SHARED MEMORY
+        // ----------------------------------------------------
+
+        if (writeVehicleData(vehicle))
+        {
+            std::cout
+                << "Speed="
+                << vehicle.speed
+                << " km/h | RPM="
+                << vehicle.rpm
+                << " | Gear="
+                << vehicle.gear
+                << " | Battery="
+                << vehicle.batteryPercent
+                << "% | Temp="
+                << vehicle.temperature
+                << " C"
+                << "\n";
+        }
+
+
+        // ----------------------------------------------------
+        // 10 Hz
+        // ----------------------------------------------------
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100)
+        );
+    }
+}
+
+
+#else
+
+
+// ============================================================
+// REAL CAN MODE
+// ============================================================
+
+void runRealCAN()
+{
+    std::cout
+        << "========================================\n"
+        << " CAN APP\n"
+        << " REAL CAN MODE\n"
+        << " Interface: "
+        << CAN_INTERFACE
+        << "\n"
+        << "========================================\n";
+
+
+    // --------------------------------------------------------
+    // Create CAN RAW socket
+    // --------------------------------------------------------
+
+    int sock =
+        socket(
+            PF_CAN,
+            SOCK_RAW,
+            CAN_RAW
+        );
+
+
+    if (sock < 0)
+    {
+        perror("socket");
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Find can0 interface
+    // --------------------------------------------------------
+
+    struct ifreq ifr {};
+
+
+    std::strncpy(
+        ifr.ifr_name,
+        CAN_INTERFACE,
+        IFNAMSIZ - 1
+    );
+
+
+    if (
+        ioctl(
+            sock,
+            SIOCGIFINDEX,
+            &ifr
+        ) < 0
+    )
+    {
+        perror("SIOCGIFINDEX");
+
+        close(sock);
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Bind
+    // --------------------------------------------------------
+
+    struct sockaddr_can addr {};
+
+
+    addr.can_family =
+        AF_CAN;
+
+
+    addr.can_ifindex =
+        ifr.ifr_ifindex;
+
+
+    if (
+        bind(
+            sock,
+            reinterpret_cast<struct sockaddr *>(&addr),
+            sizeof(addr)
+        ) < 0
+    )
+    {
+        perror("bind");
+
+        close(sock);
+
+        return;
+    }
+
+
+    std::cout
+        << "Listening on "
+        << CAN_INTERFACE
+        << "...\n";
+
+
+    VehicleData vehicle{};
+
+
+    // --------------------------------------------------------
+    // Receive CAN frames
+    // --------------------------------------------------------
+
+    while (true)
+    {
+        struct can_frame frame {};
+
+
+        int nbytes =
+            read(
+                sock,
+                &frame,
+                sizeof(frame)
+            );
+
+
+        if (nbytes < 0)
+        {
+            perror("CAN read");
+
+            break;
+        }
+
+
+        if (nbytes != sizeof(frame))
+        {
+            std::cerr
+                << "Invalid CAN frame\n";
+
+            continue;
+        }
+
+
+        printCanFrame(
+            frame
+        );
+
+
+        decodeCanFrame(
+            frame,
+            vehicle
+        );
+    }
+
+
+    close(sock);
+}
+
+
+#endif
+
+
+// ============================================================
+// MAIN
+// ============================================================
+
+int main()
+{
+    std::cout
+        << "========================================\n"
+        << " Vehicle CAN Application\n"
+        << "========================================\n";
+
+
+    // --------------------------------------------------------
+    // Initialize shared memory BEFORE CAN application
+    // --------------------------------------------------------
+
+    if (!initSharedMemory())
+    {
+        std::cerr
+            << "ERROR: Failed to initialize "
+            << "vehicle shared memory\n";
+
+        return 1;
+    }
+
+
+#if TESTING_CAN
+
+    std::thread canTestThread(runTestingCAN);
+
+    // Main application continues running here
+    std::cout << "Main application running...\n";
+
+    canTestThread.join();
+
+#else
+
+
+    std::thread canThread(runRealCAN);
+
+    // Main application continues running here
+    std::cout << "Main application running...\n";
+
+    canThread.join();
+
+#endif
+
+
+    // --------------------------------------------------------
+    // Cleanup
+    // --------------------------------------------------------
+
+    cleanupSharedMemory();
+
+
+    return 0;
+}

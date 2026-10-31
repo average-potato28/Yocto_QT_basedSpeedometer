@@ -1,0 +1,1982 @@
+#include <QGuiApplication>
+#include <QImage>
+#include <QPainter>
+#include <QTimer>
+#include <QDebug>
+#include <QtMath>
+#include <QFont>
+#include <QPen>
+#include <QColor>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+
+#include <fstream>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+
+// ============================================================
+// Display / GPIO configuration
+// ============================================================
+
+#define DISP_WIDTH      320
+#define DISP_HEIGHT     240
+
+// gpiochip512 (pinctrl-bcm2835)
+// BCM24 -> 536
+// BCM25 -> 537
+
+#define DC_GPIO         536
+#define RESET_GPIO      537
+
+#define SPI_SPEED_HZ    24000000
+
+// ============================================================
+// Speedometer configuration
+// ============================================================
+
+#define SPEED_MAX       160
+#define SPEED_TICK      2
+#define SPEED_MAJOR     20
+
+static const float GAUGE_START_DEG = -225.0f;
+static const float GAUGE_END_DEG   = 45.0f;
+
+int spi_fd = -1;
+
+// ============================================================
+// Vehicle data
+// ============================================================
+
+struct VehicleData
+{
+    float speed = 0.0f;
+
+    float batteryPercent = 78.0f;
+    float batteryVoltage = 12.6f;
+    float batteryCurrent = 4.2f;
+
+    float tripA = 12.4f;
+    float tripB = 8.7f;
+    float odometer = 1256.0f;
+
+    float averageSpeed = 52.0f;
+    float maxSpeed = 104.0f;
+    float range = 120.0f;
+
+    float temperature = 75.0f;
+    float rpm = 0.0f;
+
+    int gear = 0;
+
+    QString driveMode = "ECO";
+
+    bool leftIndicator = false;
+    bool rightIndicator = false;
+
+    bool highBeam = false;
+    bool abs = true;
+    bool bluetooth = true;
+};
+
+// ============================================================
+// GPIO helpers
+// ============================================================
+
+void gpioExport(int pin)
+{
+    std::ofstream f("/sys/class/gpio/export");
+    f << pin;
+}
+
+void gpioDirection(int pin, const char *dir)
+{
+    std::ofstream f(
+        "/sys/class/gpio/gpio" +
+        std::to_string(pin) +
+        "/direction"
+    );
+
+    f << dir;
+
+    if (f.fail())
+    {
+        qDebug()
+            << "gpioDirection failed for pin"
+            << pin;
+    }
+}
+
+void gpioWrite(int pin, int value)
+{
+    std::ofstream f(
+        "/sys/class/gpio/gpio" +
+        std::to_string(pin) +
+        "/value"
+    );
+
+    f << value;
+
+    if (f.fail())
+    {
+        qDebug()
+            << "gpioWrite failed for pin"
+            << pin
+            << "value"
+            << value;
+    }
+}
+
+// ============================================================
+// SPI initialization
+// ============================================================
+
+bool spiInit()
+{
+    spi_fd = open("/dev/spidev0.0", O_RDWR);
+
+    if (spi_fd < 0)
+    {
+        qDebug() << "Cannot open SPI";
+        return false;
+    }
+
+    uint8_t mode = SPI_MODE_0;
+    uint8_t bits = 8;
+    uint32_t speed = SPI_SPEED_HZ;
+
+    ioctl(
+        spi_fd,
+        SPI_IOC_WR_MODE,
+        &mode
+    );
+
+    ioctl(
+        spi_fd,
+        SPI_IOC_WR_BITS_PER_WORD,
+        &bits
+    );
+
+    ioctl(
+        spi_fd,
+        SPI_IOC_WR_MAX_SPEED_HZ,
+        &speed
+    );
+
+    gpioExport(DC_GPIO);
+    gpioExport(RESET_GPIO);
+
+    usleep(100000);
+
+    gpioDirection(
+        DC_GPIO,
+        "out"
+    );
+
+    gpioDirection(
+        RESET_GPIO,
+        "out"
+    );
+
+    return true;
+}
+
+// ============================================================
+// SPI write
+// ============================================================
+
+void spiWriteBytes(
+    const uint8_t *data,
+    size_t len
+)
+{
+    struct spi_ioc_transfer tr = {};
+
+    tr.tx_buf =
+        reinterpret_cast<unsigned long>(data);
+
+    tr.rx_buf = 0;
+
+    tr.len = len;
+
+    tr.speed_hz =
+        SPI_SPEED_HZ;
+
+    tr.bits_per_word = 8;
+
+    ioctl(
+        spi_fd,
+        SPI_IOC_MESSAGE(1),
+        &tr
+    );
+}
+
+// ============================================================
+// ILI9341 commands
+// ============================================================
+
+void writeCommand(uint8_t cmd)
+{
+    gpioWrite(
+        DC_GPIO,
+        0
+    );
+
+    spiWriteBytes(
+        &cmd,
+        1
+    );
+}
+
+void writeData(uint8_t data)
+{
+    gpioWrite(
+        DC_GPIO,
+        1
+    );
+
+    spiWriteBytes(
+        &data,
+        1
+    );
+}
+
+void writeDataBuf(
+    const uint8_t *buf,
+    size_t len
+)
+{
+    gpioWrite(
+        DC_GPIO,
+        1
+    );
+
+    spiWriteBytes(
+        buf,
+        len
+    );
+}
+
+// ============================================================
+// ILI9341 reset
+// ============================================================
+
+void ili9341Reset()
+{
+    gpioWrite(
+        RESET_GPIO,
+        1
+    );
+
+    usleep(50000);
+
+    gpioWrite(
+        RESET_GPIO,
+        0
+    );
+
+    usleep(50000);
+
+    gpioWrite(
+        RESET_GPIO,
+        1
+    );
+
+    usleep(150000);
+}
+
+// ============================================================
+// ILI9341 initialization
+// ============================================================
+
+void ili9341Init()
+{
+    ili9341Reset();
+
+    writeCommand(0x01);
+
+    usleep(150000);
+
+    writeCommand(0x28);
+
+    writeCommand(0xCF);
+
+    writeData(0x00);
+    writeData(0x83);
+    writeData(0x30);
+
+    writeCommand(0xED);
+
+    writeData(0x64);
+    writeData(0x03);
+    writeData(0x12);
+    writeData(0x81);
+
+    writeCommand(0xE8);
+
+    writeData(0x85);
+    writeData(0x01);
+    writeData(0x79);
+
+    writeCommand(0xCB);
+
+    writeData(0x39);
+    writeData(0x2C);
+    writeData(0x00);
+    writeData(0x34);
+    writeData(0x02);
+
+    writeCommand(0xF7);
+
+    writeData(0x20);
+
+    writeCommand(0xEA);
+
+    writeData(0x00);
+    writeData(0x00);
+
+    writeCommand(0xC0);
+
+    writeData(0x26);
+
+    writeCommand(0xC1);
+
+    writeData(0x11);
+
+    writeCommand(0xC5);
+
+    writeData(0x35);
+    writeData(0x3E);
+
+    writeCommand(0xC7);
+
+    writeData(0xBE);
+
+    uint8_t madctl = 0x48;
+
+    if (const char *env =
+            std::getenv("MADCTL_VAL"))
+    {
+        madctl =
+            static_cast<uint8_t>(
+                strtol(
+                    env,
+                    nullptr,
+                    0
+                )
+            );
+    }
+
+    qDebug()
+        << "Using MADCTL ="
+        << Qt::hex
+        << madctl;
+
+    writeCommand(0x36);
+
+    writeData(madctl);
+
+    writeCommand(0x3A);
+
+    writeData(0x55);
+
+    writeCommand(0xB1);
+
+    writeData(0x00);
+    writeData(0x1B);
+
+    writeCommand(0xF2);
+
+    writeData(0x08);
+
+    writeCommand(0x26);
+
+    writeData(0x01);
+
+    writeCommand(0x11);
+
+    usleep(150000);
+
+    writeCommand(0x29);
+}
+
+// ============================================================
+// Address window
+// ============================================================
+
+void setAddrWindow(
+    uint16_t x0,
+    uint16_t y0,
+    uint16_t x1,
+    uint16_t y1
+)
+{
+    writeCommand(0x2A);
+
+    uint8_t col[4] =
+    {
+        static_cast<uint8_t>(x0 >> 8),
+        static_cast<uint8_t>(x0),
+
+        static_cast<uint8_t>(x1 >> 8),
+        static_cast<uint8_t>(x1)
+    };
+
+    writeDataBuf(
+        col,
+        4
+    );
+
+    writeCommand(0x2B);
+
+    uint8_t row[4] =
+    {
+        static_cast<uint8_t>(y0 >> 8),
+        static_cast<uint8_t>(y0),
+
+        static_cast<uint8_t>(y1 >> 8),
+        static_cast<uint8_t>(y1)
+    };
+
+    writeDataBuf(
+        row,
+        4
+    );
+
+    writeCommand(0x2C);
+}
+
+// ============================================================
+// Push QImage to display
+// ============================================================
+
+void pushImage(
+    const QImage &img
+)
+{
+    setAddrWindow(
+        0,
+        0,
+        DISP_WIDTH - 1,
+        DISP_HEIGHT - 1
+    );
+
+    static std::vector<uint8_t> buf(
+        DISP_WIDTH *
+        DISP_HEIGHT *
+        2
+    );
+
+    size_t idx = 0;
+
+    for (
+        int y = 0;
+        y < DISP_HEIGHT;
+        ++y
+    )
+    {
+        const QRgb *line =
+            reinterpret_cast<
+                const QRgb *
+            >(
+                img.constScanLine(y)
+            );
+
+        for (
+            int x = 0;
+            x < DISP_WIDTH;
+            ++x
+        )
+        {
+            QRgb px = line[x];
+
+            uint16_t r =
+                (qRed(px) >> 3) &
+                0x1F;
+
+            uint16_t g =
+                (qGreen(px) >> 2) &
+                0x3F;
+
+            uint16_t b =
+                (qBlue(px) >> 3) &
+                0x1F;
+
+            uint16_t rgb565 =
+                (r << 11) |
+                (g << 5) |
+                b;
+
+            buf[idx++] =
+                rgb565 >> 8;
+
+            buf[idx++] =
+                rgb565 & 0xFF;
+        }
+    }
+
+    gpioWrite(
+        DC_GPIO,
+        1
+    );
+
+    const size_t chunk = 4096;
+
+    for (
+        size_t off = 0;
+        off < buf.size();
+        off += chunk
+    )
+    {
+        size_t len =
+            std::min(
+                chunk,
+                buf.size() - off
+            );
+
+        spiWriteBytes(
+            buf.data() + off,
+            len
+        );
+    }
+}
+
+// ============================================================
+// Renderer
+// ============================================================
+
+class Renderer
+{
+public:
+
+    Renderer()
+        : img(
+            DISP_WIDTH,
+            DISP_HEIGHT,
+            QImage::Format_ARGB32
+        )
+    {
+    }
+
+    // --------------------------------------------------------
+    // Speed -> gauge angle
+    // --------------------------------------------------------
+
+    float speedToAngle(
+        float speed
+    ) const
+    {
+        speed =
+            qBound(
+                0.0f,
+                speed,
+                static_cast<float>(
+                    SPEED_MAX
+                )
+            );
+
+        float t =
+            speed /
+            static_cast<float>(
+                SPEED_MAX
+            );
+
+        return
+            GAUGE_START_DEG +
+            t *
+            (
+                GAUGE_END_DEG -
+                GAUGE_START_DEG
+            );
+    }
+
+    // --------------------------------------------------------
+    // Text helper
+    // --------------------------------------------------------
+
+    void drawText(
+        QPainter &p,
+        const QString &text,
+        float x,
+        float y,
+        float w,
+        float h,
+        int size,
+        bool bold = false,
+        QColor color = Qt::white,
+        Qt::Alignment align =
+            Qt::AlignCenter
+    )
+    {
+        QFont font = p.font();
+
+        font.setPointSize(size);
+
+        font.setBold(bold);
+
+        p.setFont(font);
+
+        p.setPen(color);
+
+        p.drawText(
+            QRectF(
+                x,
+                y,
+                w,
+                h
+            ),
+            align,
+            text
+        );
+    }
+
+    // ========================================================
+    // Battery
+    // Terminal at TOP
+    // ========================================================
+
+    void drawBattery(
+        QPainter &p,
+        float percent
+    )
+    {
+        percent =
+            qBound(
+                0.0f,
+                percent,
+                100.0f
+            );
+
+        const int x = 8;
+        const int y = 32;
+
+        const int w = 35;
+        const int h = 62;
+
+        // ----------------------------------------------------
+        // Battery terminal
+        // ----------------------------------------------------
+
+        p.setPen(Qt::NoPen);
+
+        p.setBrush(Qt::white);
+
+        p.drawRect(
+            QRectF(
+                x + 11,
+                y - 5,
+                13,
+                5
+            )
+        );
+
+        // ----------------------------------------------------
+        // Battery body
+        // ----------------------------------------------------
+
+        p.setPen(
+            QPen(
+                Qt::white,
+                2
+            )
+        );
+
+        p.setBrush(
+            Qt::NoBrush
+        );
+
+        p.drawRoundedRect(
+            QRectF(
+                x,
+                y,
+                w,
+                h
+            ),
+            3,
+            3
+        );
+
+        // ----------------------------------------------------
+        // Battery fill
+        // Bottom -> Top
+        // ----------------------------------------------------
+
+        const int padding = 4;
+
+        const int innerX =
+            x + padding;
+
+        const int innerY =
+            y + padding;
+
+        const int innerW =
+            w - padding * 2;
+
+        const int innerH =
+            h - padding * 2;
+
+        const int fillHeight =
+            static_cast<int>(
+                innerH *
+                percent /
+                100.0f
+            );
+
+        // ----------------------------------------------------
+        // Battery color
+        // ----------------------------------------------------
+
+        QColor batteryColor;
+
+        if (percent > 50.0f)
+        {
+            batteryColor =
+                QColor(
+                    60,
+                    230,
+                    90
+                );
+        }
+        else if (percent > 20.0f)
+        {
+            batteryColor =
+                QColor(
+                    240,
+                    210,
+                    40
+                );
+        }
+        else
+        {
+            batteryColor =
+                QColor(
+                    240,
+                    50,
+                    50
+                );
+        }
+
+        // ----------------------------------------------------
+        // Fill
+        // ----------------------------------------------------
+
+        p.setPen(
+            Qt::NoPen
+        );
+
+        p.setBrush(
+            batteryColor
+        );
+
+        if (fillHeight > 0)
+        {
+            p.drawRect(
+                QRectF(
+                    innerX,
+                    innerY +
+                        innerH -
+                        fillHeight,
+                    innerW,
+                    fillHeight
+                )
+            );
+        }
+
+        // ----------------------------------------------------
+        // Percentage
+        // ----------------------------------------------------
+
+        drawText(
+            p,
+            QString("%1%")
+                .arg(
+                    static_cast<int>(
+                        percent
+                    )
+                ),
+            0,
+            y + h + 8,
+            52,
+            18,
+            8,
+            true,
+            batteryColor
+        );
+    }
+
+    // ========================================================
+    // Indicators
+    // ========================================================
+
+    void drawIndicator(
+        QPainter &p,
+        bool active,
+        bool left,
+        float x,
+        float y
+    )
+    {
+        QColor c =
+            active
+                ? QColor(
+                    50,
+                    255,
+                    70
+                  )
+                : QColor(
+                    30,
+                    80,
+                    35
+                  );
+
+        p.setPen(
+            Qt::NoPen
+        );
+
+        p.setBrush(c);
+
+        QPolygonF arrow;
+
+        if (left)
+        {
+            arrow
+                << QPointF(
+                    x + 18,
+                    y
+                )
+                << QPointF(
+                    x + 4,
+                    y + 7
+                )
+                << QPointF(
+                    x + 18,
+                    y + 14
+                )
+                << QPointF(
+                    x + 18,
+                    y + 10
+                )
+                << QPointF(
+                    x + 28,
+                    y + 10
+                )
+                << QPointF(
+                    x + 28,
+                    y + 4
+                )
+                << QPointF(
+                    x + 18,
+                    y + 4
+                );
+        }
+        else
+        {
+            arrow
+                << QPointF(
+                    x + 4,
+                    y
+                )
+                << QPointF(
+                    x + 18,
+                    y + 7
+                )
+                << QPointF(
+                    x + 4,
+                    y + 14
+                )
+                << QPointF(
+                    x + 4,
+                    y + 10
+                )
+                << QPointF(
+                    x - 6,
+                    y + 10
+                )
+                << QPointF(
+                    x - 6,
+                    y + 4
+                )
+                << QPointF(
+                    x + 4,
+                    y + 4
+                );
+        }
+
+        p.drawPolygon(
+            arrow
+        );
+    }
+
+    // ========================================================
+    // Speedometer
+    // ========================================================
+
+    void drawSpeedGauge(
+        QPainter &p,
+        const VehicleData &d
+    )
+    {
+        const int cx = 160;
+        const int cy = 111;
+
+        const int radius = 82;
+
+        // ----------------------------------------------------
+        // Thin outer gauge
+        // ----------------------------------------------------
+
+        QPen outerPen(
+            QColor(
+                25,
+                80,
+                120
+            ),
+            6
+        );
+
+        outerPen.setCapStyle(
+            Qt::FlatCap
+        );
+
+        p.setPen(
+            outerPen
+        );
+
+        p.drawArc(
+            cx - radius,
+            cy - radius,
+            radius * 2,
+            radius * 2,
+            static_cast<int>(
+                GAUGE_START_DEG * 16
+            ),
+            static_cast<int>(
+                (
+                    GAUGE_END_DEG -
+                    GAUGE_START_DEG
+                ) * 16
+            )
+        );
+
+        // ----------------------------------------------------
+        // Colored speed zones
+        // ----------------------------------------------------
+
+        auto drawZone =
+            [&](float fromSpeed,
+                float toSpeed,
+                QColor color)
+        {
+            QPen pen(
+                color,
+                6
+            );
+
+            pen.setCapStyle(
+                Qt::FlatCap
+            );
+
+            p.setPen(
+                pen
+            );
+
+            float a0 =
+                speedToAngle(
+                    fromSpeed
+                );
+
+            float a1 =
+                speedToAngle(
+                    toSpeed
+                );
+
+            p.drawArc(
+                cx - radius,
+                cy - radius,
+                radius * 2,
+                radius * 2,
+                static_cast<int>(
+                    a0 * 16
+                ),
+                static_cast<int>(
+                    (a1 - a0) * 16
+                )
+            );
+        };
+
+        drawZone(
+            0,
+            100,
+            QColor(
+                0,
+                180,
+                210
+            )
+        );
+
+        drawZone(
+            100,
+            130,
+            QColor(
+                235,
+                200,
+                30
+            )
+        );
+
+        drawZone(
+            130,
+            SPEED_MAX,
+            QColor(
+                230,
+                40,
+                40
+            )
+        );
+
+        // ----------------------------------------------------
+        // Tick marks
+        // ----------------------------------------------------
+
+        for (
+            int s = 0;
+            s <= SPEED_MAX;
+            s += SPEED_TICK
+        )
+        {
+            float angleDeg =
+                speedToAngle(
+                    s
+                );
+
+            float rad =
+                qDegreesToRadians(
+                    angleDeg
+                );
+
+            bool major =
+                (s % SPEED_MAJOR == 0);
+
+            float outerRadius =
+                major
+                    ? radius - 3
+                    : radius - 2;
+
+            float innerRadius =
+                major
+                    ? radius - 14
+                    : radius - 8;
+
+            QPen tickPen(
+                major
+                    ? QColor(
+                        235,
+                        240,
+                        245
+                      )
+                    : QColor(
+                        80,
+                        170,
+                        200
+                      ),
+                major ? 2 : 1
+            );
+
+            p.setPen(
+                tickPen
+            );
+
+            float ox =
+                cx +
+                std::cos(rad) *
+                outerRadius;
+
+            float oy =
+                cy -
+                std::sin(rad) *
+                outerRadius;
+
+            float ix =
+                cx +
+                std::cos(rad) *
+                innerRadius;
+
+            float iy =
+                cy -
+                std::sin(rad) *
+                innerRadius;
+
+            p.drawLine(
+                QPointF(
+                    ix,
+                    iy
+                ),
+                QPointF(
+                    ox,
+                    oy
+                )
+            );
+
+            // ------------------------------------------------
+            // Major numbers
+            // ------------------------------------------------
+
+            if (major)
+            {
+                float tx =
+                    cx +
+                    std::cos(rad) *
+                    (radius - 27);
+
+                float ty =
+                    cy -
+                    std::sin(rad) *
+                    (radius - 27);
+
+                drawText(
+                    p,
+                    QString::number(s),
+                    tx - 13,
+                    ty - 8,
+                    26,
+                    16,
+                    7,
+                    true
+                );
+            }
+        }
+
+        // ----------------------------------------------------
+        // Needle
+        // ----------------------------------------------------
+
+        float needleAngle =
+            speedToAngle(
+                d.speed
+            );
+
+        float needleRad =
+            qDegreesToRadians(
+                needleAngle
+            );
+
+        float nx =
+            cx +
+            std::cos(needleRad) *
+            (radius - 18);
+
+        float ny =
+            cy -
+            std::sin(needleRad) *
+            (radius - 18);
+
+        QPen needlePen(
+            QColor(
+                255,
+                70,
+                70
+            ),
+            4
+        );
+
+        needlePen.setCapStyle(
+            Qt::RoundCap
+        );
+
+        p.setPen(
+            needlePen
+        );
+
+        p.drawLine(
+            QPointF(
+                cx,
+                cy
+            ),
+            QPointF(
+                nx,
+                ny
+            )
+        );
+
+        // ----------------------------------------------------
+        // Needle hub
+        // ----------------------------------------------------
+
+        p.setPen(
+            QPen(
+                Qt::black,
+                1
+            )
+        );
+
+        p.setBrush(
+            QColor(
+                230,
+                230,
+                230
+            )
+        );
+
+        p.drawEllipse(
+            QPointF(
+                cx,
+                cy
+            ),
+            6,
+            6
+        );
+
+        // ----------------------------------------------------
+        // Digital speed
+        // ----------------------------------------------------
+
+        drawText(
+            p,
+            QString::number(
+                static_cast<int>(
+                    d.speed
+                )
+            ),
+            85,
+            88,
+            150,
+            42,
+            29,
+            true,
+            Qt::white
+        );
+
+        drawText(
+            p,
+            "km/h",
+            130,
+            126,
+            60,
+            15,
+            8,
+            false,
+            QColor(
+                180,
+                190,
+                200
+            )
+        );
+    }
+
+    // ========================================================
+    // Main drawing
+    // ========================================================
+
+    void draw(
+        const VehicleData &d
+    )
+    {
+        img.fill(
+            QColor(
+                3,
+                7,
+                12
+            )
+        );
+
+        QPainter p(
+            &img
+        );
+
+        p.setRenderHint(
+            QPainter::Antialiasing,
+            true
+        );
+
+        // ====================================================
+        // Top status
+        // ====================================================
+
+        drawText(
+            p,
+            "10:24",
+            55,
+            4,
+            55,
+            18,
+            9,
+            true
+        );
+
+        drawText(
+            p,
+            "28 C",
+            112,
+            4,
+            50,
+            18,
+            8,
+            false,
+            QColor(
+                120,
+                210,
+                255
+            )
+        );
+
+        // ====================================================
+        // Indicators
+        // ====================================================
+
+        drawIndicator(
+            p,
+            d.leftIndicator,
+            true,
+            8,
+            8
+        );
+
+        drawIndicator(
+            p,
+            d.rightIndicator,
+            false,
+            292,
+            8
+        );
+
+        // ====================================================
+        // Battery
+        // ====================================================
+
+        drawBattery(
+            p,
+            d.batteryPercent
+        );
+
+        // ====================================================
+        // Main speedometer
+        // ====================================================
+
+        drawSpeedGauge(
+            p,
+            d
+        );
+
+        // ====================================================
+        // Gear / drive mode
+        // No boxes
+        // ====================================================
+
+        drawText(
+            p,
+            "GEAR",
+            270,
+            35,
+            45,
+            10,
+            6,
+            true,
+            QColor(
+                120,
+                180,
+                220
+            )
+        );
+
+        QString gearText;
+
+        if (d.gear == 0)
+            gearText = "N";
+        else
+            gearText =
+                QString::number(
+                    d.gear
+                );
+
+        drawText(
+            p,
+            gearText,
+            270,
+            43,
+            45,
+            24,
+            17,
+            true,
+            QColor(
+                70,
+                255,
+                80
+            )
+        );
+
+        drawText(
+            p,
+            d.driveMode,
+            270,
+            70,
+            45,
+            18,
+            8,
+            true,
+            QColor(
+                70,
+                255,
+                100
+            )
+        );
+
+        // ====================================================
+        // Trip / Odometer / Average
+        // No boxes
+        // ====================================================
+
+        drawText(
+            p,
+            "TRIP A",
+            4,
+            156,
+            76,
+            11,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.tripA,
+                'f',
+                1
+            ) + " km",
+            4,
+            166,
+            76,
+            16,
+            8,
+            true
+        );
+
+        drawText(
+            p,
+            "TRIP B",
+            83,
+            156,
+            76,
+            11,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.tripB,
+                'f',
+                1
+            ) + " km",
+            83,
+            166,
+            76,
+            16,
+            8,
+            true
+        );
+
+        drawText(
+            p,
+            "ODO",
+            162,
+            156,
+            76,
+            11,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.odometer,
+                'f',
+                0
+            ) + " km",
+            162,
+            166,
+            76,
+            16,
+            8,
+            true
+        );
+
+        drawText(
+            p,
+            "AVG",
+            241,
+            156,
+            75,
+            11,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.averageSpeed,
+                'f',
+                0
+            ),
+            241,
+            166,
+            75,
+            16,
+            9,
+            true
+        );
+
+        // ====================================================
+        // Bottom telemetry
+        // No boxes
+        // ====================================================
+
+        drawText(
+            p,
+            "RANGE",
+            4,
+            195,
+            76,
+            10,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.range,
+                'f',
+                0
+            ) + " km",
+            4,
+            205,
+            76,
+            18,
+            8,
+            true,
+            QColor(
+                255,
+                220,
+                50
+            )
+        );
+
+        drawText(
+            p,
+            "VOLT",
+            83,
+            195,
+            76,
+            10,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.batteryVoltage,
+                'f',
+                1
+            ) + " V",
+            83,
+            205,
+            76,
+            18,
+            8,
+            true,
+            QColor(
+                80,
+                230,
+                100
+            )
+        );
+
+        drawText(
+            p,
+            "TEMP",
+            162,
+            195,
+            76,
+            10,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                d.temperature,
+                'f',
+                0
+            ) + " C",
+            162,
+            205,
+            76,
+            18,
+            8,
+            true,
+            d.temperature > 95
+                ? QColor(
+                    255,
+                    60,
+                    60
+                  )
+                : Qt::white
+        );
+
+        drawText(
+            p,
+            "RPM",
+            241,
+            195,
+            75,
+            10,
+            6,
+            true,
+            QColor(
+                110,
+                190,
+                230
+            )
+        );
+
+        drawText(
+            p,
+            QString::number(
+                static_cast<int>(
+                    d.rpm
+                )
+            ),
+            241,
+            205,
+            75,
+            18,
+            8,
+            true
+        );
+
+        // ====================================================
+        // Small status indicators
+        // ====================================================
+
+        if (d.highBeam)
+        {
+            drawText(
+                p,
+                "HIGH",
+                90,
+                16,
+                35,
+                12,
+                6,
+                true,
+                QColor(
+                    60,
+                    160,
+                    255
+                )
+            );
+        }
+
+        if (d.abs)
+        {
+            drawText(
+                p,
+                "ABS",
+                210,
+                16,
+                30,
+                12,
+                6,
+                true,
+                QColor(
+                    255,
+                    190,
+                    40
+                )
+            );
+        }
+
+        if (d.bluetooth)
+        {
+            drawText(
+                p,
+                "BT",
+                245,
+                16,
+                25,
+                12,
+                6,
+                true,
+                QColor(
+                    70,
+                    180,
+                    255
+                )
+            );
+        }
+
+        p.end();
+    }
+
+    QImage img;
+};
+
+// ============================================================
+// Demo data
+// ============================================================
+
+void updateDemoData(
+    VehicleData &d,
+    float &t
+)
+{
+    // --------------------------------------------------------
+    // Speed
+    // --------------------------------------------------------
+
+    d.speed =
+        (
+            std::sin(t) *
+            0.5f +
+            0.5f
+        ) *
+        SPEED_MAX;
+
+    // --------------------------------------------------------
+    // RPM
+    // --------------------------------------------------------
+
+    d.rpm =
+        d.speed *
+        65.0f;
+
+    // --------------------------------------------------------
+    // Battery
+    // --------------------------------------------------------
+
+    d.batteryPercent =
+        78.0f -
+        (
+            std::fmod(
+                t * 0.12f,
+                18.0f
+            )
+        );
+
+    if (d.batteryPercent < 10)
+        d.batteryPercent = 78;
+
+    d.batteryVoltage =
+        12.0f +
+        d.batteryPercent *
+        0.008f;
+
+    d.batteryCurrent =
+        2.0f +
+        d.speed *
+        0.04f;
+
+    // --------------------------------------------------------
+    // Temperature
+    // --------------------------------------------------------
+
+    d.temperature =
+        55.0f +
+        d.speed *
+        0.18f;
+
+    // --------------------------------------------------------
+    // Trip
+    // --------------------------------------------------------
+
+    d.tripA +=
+        d.speed /
+        3600.0f *
+        0.06f;
+
+    // --------------------------------------------------------
+    // Average speed
+    // --------------------------------------------------------
+
+    d.averageSpeed =
+        35.0f +
+        d.speed *
+        0.35f;
+
+    // --------------------------------------------------------
+    // Maximum speed
+    // --------------------------------------------------------
+
+    d.maxSpeed =
+        std::max(
+            d.maxSpeed,
+            d.speed
+        );
+
+    // --------------------------------------------------------
+    // Range
+    // --------------------------------------------------------
+
+    d.range =
+        d.batteryPercent *
+        1.55f;
+
+    // --------------------------------------------------------
+    // Demo gear
+    // --------------------------------------------------------
+
+    if (d.speed < 5)
+        d.gear = 0;
+
+    else if (d.speed < 20)
+        d.gear = 1;
+
+    else if (d.speed < 40)
+        d.gear = 2;
+
+    else if (d.speed < 65)
+        d.gear = 3;
+
+    else if (d.speed < 90)
+        d.gear = 4;
+
+    else if (d.speed < 120)
+        d.gear = 5;
+
+    else
+        d.gear = 6;
+
+    // --------------------------------------------------------
+    // Indicators
+    // --------------------------------------------------------
+
+    d.leftIndicator =
+        (
+            static_cast<int>(
+                t * 2
+            ) % 20
+        ) == 0;
+
+    d.rightIndicator =
+        false;
+
+    // --------------------------------------------------------
+    // High beam
+    // --------------------------------------------------------
+
+    d.highBeam =
+        d.speed > 110;
+
+    // --------------------------------------------------------
+    // Time
+    // --------------------------------------------------------
+
+    t += 0.025f;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+int main(
+    int argc,
+    char *argv[]
+)
+{
+    QGuiApplication app(
+        argc,
+        argv
+    );
+
+    if (!spiInit())
+    {
+        qDebug()
+            << "SPI init failed";
+
+        return 1;
+    }
+
+    ili9341Init();
+
+    Renderer renderer;
+
+    VehicleData vehicle;
+
+    float t = 0.0f;
+
+    QTimer timer;
+
+    QObject::connect(
+        &timer,
+        &QTimer::timeout,
+        [&]()
+        {
+            updateDemoData(
+                vehicle,
+                t
+            );
+
+            renderer.draw(
+                vehicle
+            );
+
+            pushImage(
+                renderer.img
+            );
+        }
+    );
+
+    // --------------------------------------------------------
+    // ~20 FPS
+    // --------------------------------------------------------
+
+    timer.start(50);
+
+    return app.exec();
+}

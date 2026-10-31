@@ -1,0 +1,5 @@
+yocto/
+*_key
+*_key.pub
+*.wic*
+*.rpi-sdimg

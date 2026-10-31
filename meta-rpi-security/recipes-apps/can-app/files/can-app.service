@@ -1,0 +1,16 @@
+[Unit]
+Description=CAN Vehicle Data Application
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+Nice=-5
+ExecStart=/usr/bin/can-app
+ExecStartPost=/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do [ -e /dev/shm/vehicle_data ] && exit 0; i=$((i+1)); sleep 0.1; done; echo "ERROR: vehicle_data was not created"; exit 1'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

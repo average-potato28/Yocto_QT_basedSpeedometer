@@ -1,0 +1,1051 @@
+// ============================================================================
+// Dashboard display  (ILI9341 over SPI, 320x240, RGB565)
+//
+//   CAN app --(shm + futex wake)--> ShmWatcher --> RenderThread --> DisplayThread --> SPI
+//                                      |               |                |
+//                                 blocks in the   blocks on a       blocks on a
+//                                 kernel (futex)  condvar           condvar
+//
+//   Main thread: only runs the Qt event loop and waits for SIGINT/SIGTERM.
+//
+//   No polling timers and no per-frame heap allocation:
+//     * every thread sleeps until there is real work
+//     * render only when data / animation / clock changed
+//     * only the screen bands that changed are sent over SPI
+//     * triple-buffered, pre-allocated frames, "latest frame wins"
+// ============================================================================
+
+#include <QGuiApplication>
+#include <QImage>
+#include <QPainter>
+#include <QPolygonF>
+#include <QThread>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QWaitCondition>
+#include <QSocketNotifier>
+#include <QElapsedTimer>
+#include <QByteArray>
+#include <QHash>
+#include <QTime>
+#include <QDebug>
+#include <QtMath>
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+
+#include "vehicle-data.h"
+#include "vehicle-shm.h"
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+static constexpr int DISP_W = 320;
+static constexpr int DISP_H = 240;
+
+static constexpr int    BAND_ROWS   = 20;                       // dirty-tracking granularity
+static constexpr int    BANDS       = DISP_H / BAND_ROWS;
+static constexpr size_t FRAME_BYTES = size_t(DISP_W) * DISP_H * 2;
+static constexpr size_t BAND_BYTES  = size_t(DISP_W) * BAND_ROWS * 2;
+static_assert(DISP_H % BAND_ROWS == 0, "BAND_ROWS must divide DISP_H");
+static_assert((DISP_W * 2) % 4 == 0, "QImage rows must be tightly packed");
+
+static constexpr int      DC_GPIO    = 536;
+static constexpr int      RESET_GPIO = 537;
+static constexpr const char *SPI_DEV = "/dev/spidev0.0";
+static constexpr uint32_t SPI_HZ     = 24000000;
+
+static constexpr int FRAME_INTERVAL_MS = 33;    // max ~30 FPS
+static constexpr int CLOCK_TICK_MS     = 1000;  // idle wake-up to update the clock
+static constexpr int FULL_REFRESH_MS   = 5000;  // heals EMI / glitched panel RAM
+static constexpr int SHM_WAIT_MS       = 100;   // futex timeout = stale-check period
+static constexpr int STALE_MS          = 500;   // no writer heartbeat -> "NO DATA"
+static constexpr int REOPEN_MS         = 3000;  // re-attach if segment was recreated
+
+static constexpr int   SPEED_MAX   = 160;
+static constexpr int   SPEED_TICK  = 2;
+static constexpr int   SPEED_MAJOR = 20;
+static constexpr float GAUGE_START_DEG = -225.0f;
+static constexpr float GAUGE_END_DEG   =   45.0f;
+
+static const QColor kBackground(3, 7, 12);
+static const QColor kLabel(110, 190, 230);
+static const QColor kDim(180, 190, 200);
+static const QColor kGreen(70, 255, 80);
+static const QColor kAlarm(255, 60, 60);
+
+// ============================================================================
+// Hardware layer
+// ============================================================================
+
+namespace hw {
+
+static bool writeSysfs(const std::string &path, const std::string &value)
+{
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    const ssize_t n = ::write(fd, value.data(), value.size());
+    ::close(fd);
+    return n == static_cast<ssize_t>(value.size());
+}
+
+// GPIO output. The value file stays open, so a toggle is one write() instead
+// of open+write+close, and redundant writes are skipped entirely.
+class GpioOut
+{
+public:
+    ~GpioOut() { release(); }
+
+    bool open(int pin)
+    {
+        const std::string base = "/sys/class/gpio/gpio" + std::to_string(pin);
+
+        if (access(base.c_str(), F_OK) != 0)
+        {
+            if (!writeSysfs("/sys/class/gpio/export", std::to_string(pin)))
+            {
+                qWarning() << "GPIO export failed:" << pin;
+                return false;
+            }
+            for (int i = 0; i < 50 && access((base + "/direction").c_str(), W_OK) != 0; ++i)
+                usleep(10000); // wait for udev to fix permissions
+        }
+
+        if (!writeSysfs(base + "/direction", "out"))
+        {
+            qWarning() << "GPIO direction failed:" << pin;
+            return false;
+        }
+
+        fd_ = ::open((base + "/value").c_str(), O_WRONLY | O_CLOEXEC);
+        cur_ = -1;
+        return fd_ >= 0;
+    }
+
+    bool set(bool v)
+    {
+        if (cur_ == (v ? 1 : 0))
+            return true;
+
+        const char c = v ? '1' : '0';
+        if (::pwrite(fd_, &c, 1, 0) != 1)
+            return false;
+
+        cur_ = v ? 1 : 0;
+        return true;
+    }
+
+    void release()
+    {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+
+private:
+    int fd_  = -1;
+    int cur_ = -1;
+};
+
+class SpiBus
+{
+public:
+    ~SpiBus() { release(); }
+
+    bool open(const char *dev, uint32_t hz)
+    {
+        fd_ = ::open(dev, O_RDWR | O_CLOEXEC);
+        if (fd_ < 0)
+        {
+            qWarning() << "Cannot open" << dev << std::strerror(errno);
+            return false;
+        }
+
+        uint8_t  mode = SPI_MODE_0;
+        uint8_t  bits = 8;
+        uint32_t speed = hz;
+
+        if (ioctl(fd_, SPI_IOC_WR_MODE, &mode) < 0 ||
+            ioctl(fd_, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
+            ioctl(fd_, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0)
+        {
+            qWarning() << "SPI configuration failed" << std::strerror(errno);
+            release();
+            return false;
+        }
+
+        hz_      = hz;
+        maxXfer_ = queryBufsiz();
+        return true;
+    }
+
+    // Splits into chunks that respect the spidev buffer size.
+    bool write(const uint8_t *data, size_t len)
+    {
+        while (len > 0)
+        {
+            const size_t n = std::min(len, maxXfer_);
+
+            struct spi_ioc_transfer tr {};
+            tr.tx_buf        = static_cast<__u64>(reinterpret_cast<uintptr_t>(data));
+            tr.len           = static_cast<__u32>(n);
+            tr.speed_hz      = hz_;
+            tr.bits_per_word = 8;
+
+            int rc;
+            do { rc = ioctl(fd_, SPI_IOC_MESSAGE(1), &tr); } while (rc < 0 && errno == EINTR);
+            if (rc < 0)
+                return false;
+
+            data += n;
+            len  -= n;
+        }
+        return true;
+    }
+
+    size_t maxTransfer() const { return maxXfer_; }
+
+    void release()
+    {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+
+private:
+    // /sys/module/spidev/parameters/bufsiz (default 4096). Raise it with
+    // spidev.bufsiz=32768 on the kernel command line for fewer transfers.
+    static size_t queryBufsiz()
+    {
+        size_t value = 4096;
+        if (FILE *f = std::fopen("/sys/module/spidev/parameters/bufsiz", "r"))
+        {
+            unsigned v = 0;
+            if (std::fscanf(f, "%u", &v) == 1 && v >= 64)
+                value = std::min<size_t>(v, 65536);
+            std::fclose(f);
+        }
+        return value;
+    }
+
+    int      fd_      = -1;
+    uint32_t hz_      = 0;
+    size_t   maxXfer_ = 4096;
+};
+
+class Ili9341
+{
+public:
+    bool begin()
+    {
+        if (!spi_.open(SPI_DEV, SPI_HZ) || !dc_.open(DC_GPIO) || !rst_.open(RESET_GPIO))
+            return false;
+
+        scratch_.resize(std::max<size_t>(spi_.maxTransfer() / 2, 64));
+        return init();
+    }
+
+    bool reinit() { return init(); }
+
+    // Send 'rows' full-width rows starting at y0. Pixels are native-endian
+    // RGB565 (QImage::Format_RGB16); byte-swapping to the panel's big-endian
+    // order happens in small chunks, so no full-frame conversion buffer.
+    bool writeRows(int y0, int rows, const uint16_t *px)
+    {
+        const int y1 = y0 + rows - 1;
+
+        const uint8_t col[4] = { 0, 0,
+                                 static_cast<uint8_t>((DISP_W - 1) >> 8),
+                                 static_cast<uint8_t>((DISP_W - 1) & 0xFF) };
+        const uint8_t row[4] = { static_cast<uint8_t>(y0 >> 8), static_cast<uint8_t>(y0 & 0xFF),
+                                 static_cast<uint8_t>(y1 >> 8), static_cast<uint8_t>(y1 & 0xFF) };
+
+        if (!command(0x2A, col, 4) || !command(0x2B, row, 4) || !command(0x2C))
+            return false;
+
+        if (!dc_.set(true))
+            return false;
+
+        size_t remaining = static_cast<size_t>(rows) * DISP_W;
+        while (remaining > 0)
+        {
+            const size_t n = std::min(remaining, scratch_.size());
+            for (size_t i = 0; i < n; ++i)
+                scratch_[i] = __builtin_bswap16(px[i]);
+
+            if (!spi_.write(reinterpret_cast<const uint8_t *>(scratch_.data()), n * 2))
+                return false;
+
+            px        += n;
+            remaining -= n;
+        }
+        return true;
+    }
+
+private:
+    struct InitStep
+    {
+        uint8_t  cmd;
+        uint8_t  nargs;
+        uint8_t  args[5];
+        uint16_t delayMs;
+    };
+
+    bool command(uint8_t cmd, const uint8_t *args = nullptr, size_t n = 0)
+    {
+        if (!dc_.set(false) || !spi_.write(&cmd, 1))
+            return false;
+
+        if (n > 0)
+            return dc_.set(true) && spi_.write(args, n);
+
+        return true;
+    }
+
+    bool init()
+    {
+        // hardware reset
+        rst_.set(true);  usleep(50000);
+        rst_.set(false); usleep(50000);
+        rst_.set(true);  usleep(150000);
+
+        uint8_t madctl = 0x28; // landscape + BGR. Override with MADCTL_VAL=0x.. as before
+        if (const char *env = std::getenv("MADCTL_VAL"))
+            madctl = static_cast<uint8_t>(std::strtol(env, nullptr, 0));
+        qInfo() << "Using MADCTL =" << Qt::hex << madctl;
+
+        static const InitStep steps[] = {
+            { 0x01, 0, {},                                  150 }, // software reset
+            { 0x28, 0, {},                                    0 }, // display off
+            { 0xCF, 3, { 0x00, 0x83, 0x30 },                  0 },
+            { 0xED, 4, { 0x64, 0x03, 0x12, 0x81 },            0 },
+            { 0xE8, 3, { 0x85, 0x01, 0x79 },                  0 },
+            { 0xCB, 5, { 0x39, 0x2C, 0x00, 0x34, 0x02 },      0 },
+            { 0xF7, 1, { 0x20 },                              0 },
+            { 0xEA, 2, { 0x00, 0x00 },                        0 },
+            { 0xC0, 1, { 0x26 },                              0 },
+            { 0xC1, 1, { 0x11 },                              0 },
+            { 0xC5, 2, { 0x35, 0x3E },                        0 },
+            { 0xC7, 1, { 0xBE },                              0 },
+            { 0x36, 1, { 0x00 },                              0 }, // MADCTL (patched below)
+            { 0x3A, 1, { 0x55 },                              0 }, // 16 bit / pixel
+            { 0xB1, 2, { 0x00, 0x1B },                        0 },
+            { 0xF2, 1, { 0x08 },                              0 },
+            { 0x26, 1, { 0x01 },                              0 },
+            { 0x11, 0, {},                                  150 }, // sleep out
+            { 0x29, 0, {},                                    0 }, // display on
+        };
+
+        for (const InitStep &s : steps)
+        {
+            uint8_t args[5];
+            std::memcpy(args, s.args, sizeof args);
+            if (s.cmd == 0x36)
+                args[0] = madctl;
+
+            if (!command(s.cmd, args, s.nargs))
+                return false;
+
+            if (s.delayMs)
+                usleep(s.delayMs * 1000u);
+        }
+        return true;
+    }
+
+    SpiBus                spi_;
+    GpioOut               dc_;
+    GpioOut               rst_;
+    std::vector<uint16_t> scratch_;
+};
+
+} // namespace hw
+
+// ============================================================================
+// Renderer
+//
+// The static part of the dashboard (gauge face, ticks, labels, battery
+// outline) is painted ONCE into a background image. Each frame is then:
+//   memcpy(background) + paint only the dynamic elements.
+// Fonts are cached, frames are RGB16 (half the memory of ARGB32) and nothing
+// is allocated per frame.
+// ============================================================================
+
+class Renderer
+{
+public:
+    Renderer() : bg_(DISP_W, DISP_H, QImage::Format_RGB16) { paintStatic(); }
+
+    void render(QImage &dst, const VehicleData &d, float shownSpeed, bool stale, const QTime &now)
+    {
+        std::memcpy(dst.bits(), bg_.constBits(), FRAME_BYTES);
+
+        QPainter p(&dst);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        text(p, now.toString("HH:mm"), 55, 4, 55, 18, 9, true);
+
+        drawIndicator(p, d.leftIndicator,  true,  8,   8);
+        drawIndicator(p, d.rightIndicator, false, 292, 8);
+
+        drawBatteryFill(p, d.batteryPercent);
+        drawNeedle(p, shownSpeed);
+
+        text(p, stale ? QString("--") : QString::number(static_cast<int>(d.speed)),
+             85, 88, 150, 42, 29, true);
+        if (stale)
+            text(p, "NO DATA", 120, 126, 80, 15, 8, true, kAlarm);
+        else
+            text(p, "km/h", 130, 126, 60, 15, 8, false, kDim);
+
+        const int gear = static_cast<int>(d.gear);
+        text(p, gear == 0 ? QString("N") : QString::number(gear), 270, 43, 45, 24, 17, true, kGreen);
+        // driveMode is a fixed char array in VehicleData; strnlen guards against a missing '\0'
+        text(p, QString::fromLatin1(d.driveMode,
+                                    static_cast<int>(strnlen(d.driveMode, sizeof d.driveMode))),
+             270, 70, 45, 18, 8, true, QColor(70, 255, 100));
+
+        text(p, QString::number(d.tripA, 'f', 1) + " km", 4,   166, 76, 16, 8, true);
+        text(p, QString::number(d.tripB, 'f', 1) + " km", 83,  166, 76, 16, 8, true);
+        text(p, QString::number(d.odometer, 'f', 0) + " km", 162, 166, 76, 16, 8, true);
+        text(p, QString::number(d.averageSpeed, 'f', 0),  241, 166, 75, 16, 9, true);
+
+        text(p, QString::number(d.range, 'f', 0) + " km", 4, 205, 76, 18, 8, true, QColor(255, 220, 50));
+        text(p, QString::number(d.batteryVoltage, 'f', 1) + " V", 83, 205, 76, 18, 8, true, QColor(80, 230, 100));
+        text(p, QString::number(d.temperature, 'f', 0) + " C", 162, 205, 76, 18, 8, true,
+             d.temperature > 95 ? kAlarm : QColor(Qt::white));
+        text(p, QString::number(static_cast<int>(d.rpm)), 241, 205, 75, 18, 8, true);
+
+        if (d.highBeam)  text(p, "HIGH", 90,  16, 35, 12, 6, true, QColor(60, 160, 255));
+        if (d.abs)       text(p, "ABS",  210, 16, 30, 12, 6, true, QColor(255, 190, 40));
+        if (d.bluetooth) text(p, "BT",   245, 16, 25, 12, 6, true, QColor(70, 180, 255));
+    }
+
+private:
+    static constexpr int CX = 160, CY = 111, RADIUS = 82;
+
+    static const char *driveModeName(int mode)
+    {
+        static const char *names[] = { "ECO", "NORMAL", "SPORT" };
+        return names[std::clamp(mode, 0, 2)];
+    }
+
+    static float speedToAngle(float speed)
+    {
+        speed = qBound(0.0f, speed, static_cast<float>(SPEED_MAX));
+        return GAUGE_START_DEG + (speed / SPEED_MAX) * (GAUGE_END_DEG - GAUGE_START_DEG);
+    }
+
+    const QFont &font(int pt, bool bold)
+    {
+        const int key = pt * 2 + (bold ? 1 : 0);
+        auto it = fonts_.find(key);
+        if (it == fonts_.end())
+        {
+            QFont f;
+            f.setPointSize(pt);
+            f.setBold(bold);
+            it = fonts_.insert(key, f);
+        }
+        return it.value();
+    }
+
+    void text(QPainter &p, const QString &s, float x, float y, float w, float h, int pt,
+              bool bold = false, const QColor &color = Qt::white,
+              Qt::Alignment align = Qt::AlignCenter)
+    {
+        p.setFont(font(pt, bold));
+        p.setPen(color);
+        p.drawText(QRectF(x, y, w, h), align, s);
+    }
+
+    // ---------------------------------------------------------- static layer
+    void paintStatic()
+    {
+        bg_.fill(kBackground);
+
+        QPainter p(&bg_);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        // gauge arc + colour zones
+        QPen outer(QColor(25, 80, 120), 6);
+        outer.setCapStyle(Qt::FlatCap);
+        p.setPen(outer);
+        p.drawArc(CX - RADIUS, CY - RADIUS, RADIUS * 2, RADIUS * 2,
+                  static_cast<int>(GAUGE_START_DEG * 16),
+                  static_cast<int>((GAUGE_END_DEG - GAUGE_START_DEG) * 16));
+
+        auto zone = [&](float from, float to, const QColor &c)
+        {
+            QPen pen(c, 6);
+            pen.setCapStyle(Qt::FlatCap);
+            p.setPen(pen);
+            const float a0 = speedToAngle(from), a1 = speedToAngle(to);
+            p.drawArc(CX - RADIUS, CY - RADIUS, RADIUS * 2, RADIUS * 2,
+                      static_cast<int>(a0 * 16), static_cast<int>((a1 - a0) * 16));
+        };
+        zone(0,   100,       QColor(0, 180, 210));
+        zone(100, 130,       QColor(235, 200, 30));
+        zone(130, SPEED_MAX, QColor(230, 40, 40));
+
+        // ticks + numbers
+        for (int s = 0; s <= SPEED_MAX; s += SPEED_TICK)
+        {
+            const float rad   = qDegreesToRadians(speedToAngle(static_cast<float>(s)));
+            const bool  major = (s % SPEED_MAJOR == 0);
+
+            const float ro = major ? RADIUS - 3  : RADIUS - 2;
+            const float ri = major ? RADIUS - 14 : RADIUS - 8;
+
+            p.setPen(QPen(major ? QColor(235, 240, 245) : QColor(80, 170, 200), major ? 2 : 1));
+            p.drawLine(QPointF(CX + std::cos(rad) * ri, CY - std::sin(rad) * ri),
+                       QPointF(CX + std::cos(rad) * ro, CY - std::sin(rad) * ro));
+
+            if (major)
+            {
+                const float tx = CX + std::cos(rad) * (RADIUS - 27);
+                const float ty = CY - std::sin(rad) * (RADIUS - 27);
+                text(p, QString::number(s), tx - 13, ty - 8, 26, 16, 7, true);
+            }
+        }
+
+        // battery outline (terminal at the bottom, as before)
+        p.setPen(QPen(Qt::white, 2));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(QRectF(BAT_X, BAT_Y, BAT_W, BAT_H), 3, 3);
+        p.setPen(Qt::NoPen);
+        p.setBrush(Qt::white);
+        p.drawRect(QRectF(BAT_X + 11, BAT_Y + BAT_H, 13, 5));
+
+        // fixed labels
+        text(p, "28 C",  112, 4, 50, 18, 8, false, QColor(120, 210, 255)); // placeholder, no CAN signal yet
+        text(p, "GEAR",  270, 35, 45, 10, 6, true, QColor(120, 180, 220));
+
+        text(p, "TRIP A", 4,   156, 76, 11, 6, true, kLabel);
+        text(p, "TRIP B", 83,  156, 76, 11, 6, true, kLabel);
+        text(p, "ODO",    162, 156, 76, 11, 6, true, kLabel);
+        text(p, "AVG",    241, 156, 75, 11, 6, true, kLabel);
+
+        text(p, "RANGE",  4,   195, 76, 10, 6, true, kLabel);
+        text(p, "VOLT",   83,  195, 76, 10, 6, true, kLabel);
+        text(p, "TEMP",   162, 195, 76, 10, 6, true, kLabel);
+        text(p, "RPM",    241, 195, 75, 10, 6, true, kLabel);
+    }
+
+    // --------------------------------------------------------- dynamic layer
+    static constexpr int BAT_X = 8, BAT_Y = 32, BAT_W = 35, BAT_H = 62;
+
+    void drawBatteryFill(QPainter &p, float percent)
+    {
+        percent = qBound(0.0f, percent, 100.0f);
+
+        constexpr int pad = 4;
+        const int innerH  = BAT_H - pad * 2;
+        const int fillH   = static_cast<int>(innerH * percent / 100.0f);
+
+        if (fillH > 0)
+        {
+            p.setPen(Qt::NoPen);
+            p.setBrush(Qt::white);
+            p.drawRect(QRectF(BAT_X + pad, BAT_Y + pad, BAT_W - pad * 2, fillH));
+        }
+
+        text(p, QString("%1%").arg(static_cast<int>(percent)), 0, BAT_Y + BAT_H + 13, 52, 18, 8, true);
+    }
+
+    void drawIndicator(QPainter &p, bool active, bool left, float x, float y)
+    {
+        p.setPen(Qt::NoPen);
+        p.setBrush(active ? QColor(50, 255, 70) : QColor(30, 80, 35));
+
+        QPolygonF arrow;
+        if (left)
+            arrow << QPointF(x + 18, y)      << QPointF(x + 4,  y + 7)  << QPointF(x + 18, y + 14)
+                  << QPointF(x + 18, y + 10) << QPointF(x + 28, y + 10) << QPointF(x + 28, y + 4)
+                  << QPointF(x + 18, y + 4);
+        else
+            arrow << QPointF(x + 4, y)      << QPointF(x + 18, y + 7)  << QPointF(x + 4, y + 14)
+                  << QPointF(x + 4, y + 10) << QPointF(x - 6,  y + 10) << QPointF(x - 6, y + 4)
+                  << QPointF(x + 4, y + 4);
+
+        p.drawPolygon(arrow);
+    }
+
+    void drawNeedle(QPainter &p, float speed)
+    {
+        const float rad = qDegreesToRadians(speedToAngle(speed));
+
+        QPen pen(QColor(255, 70, 70), 4);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.drawLine(QPointF(CX, CY),
+                   QPointF(CX + std::cos(rad) * (RADIUS - 18), CY - std::sin(rad) * (RADIUS - 18)));
+
+        p.setPen(QPen(Qt::black, 1));
+        p.setBrush(QColor(230, 230, 230));
+        p.drawEllipse(QPointF(CX, CY), 6, 6);
+    }
+
+    QImage            bg_;
+    QHash<int, QFont> fonts_;
+};
+
+// ============================================================================
+// Thread plumbing
+// ============================================================================
+
+// Latest vehicle snapshot: ShmWatcher -> RenderThread.
+// One slot, not a queue: stale intermediate values are simply overwritten.
+class LatestState
+{
+public:
+    enum class Wake { Stop, Event, Timeout };
+
+    void post(const VehicleData &d)
+    {
+        QMutexLocker l(&m_);
+        data_  = d;
+        stale_ = false;
+        dirty_ = true;
+        cv_.wakeOne();
+    }
+
+    void setStale(bool s)
+    {
+        QMutexLocker l(&m_);
+        if (stale_ != s) { stale_ = s; dirty_ = true; cv_.wakeOne(); }
+    }
+
+    void stop()
+    {
+        QMutexLocker l(&m_);
+        stop_ = true;
+        cv_.wakeAll();
+    }
+
+    // Sleeps until an event, the timeout, or stop(). timeoutMs == 0 never blocks.
+    Wake wait(int timeoutMs, VehicleData &d, bool &stale)
+    {
+        QMutexLocker l(&m_);
+        if (!dirty_ && !stop_ && timeoutMs > 0)
+            cv_.wait(&m_, static_cast<unsigned long>(timeoutMs));
+
+        if (stop_)
+            return Wake::Stop;
+
+        d     = data_;
+        stale = stale_;
+
+        if (!dirty_)
+            return Wake::Timeout;
+
+        dirty_ = false;
+        return Wake::Event;
+    }
+
+private:
+    QMutex         m_;
+    QWaitCondition cv_;
+    VehicleData    data_{};
+    bool           stale_ = true;   // "NO DATA" until the first sample arrives
+    bool           dirty_ = false;
+    bool           stop_  = false;
+};
+
+// Triple buffer: RenderThread -> DisplayThread. Frames are allocated once.
+// The renderer always has a private "back" buffer, the display thread a
+// private "front" buffer, and the newest finished frame waits in "ready".
+class FrameExchange
+{
+public:
+    FrameExchange()
+    {
+        for (QImage &b : bufs_)
+        {
+            b = QImage(DISP_W, DISP_H, QImage::Format_RGB16);
+            b.fill(Qt::black);
+        }
+    }
+
+    QImage &back() { return bufs_[back_]; }   // only touched by the render thread
+
+    void publish()
+    {
+        QMutexLocker l(&m_);
+        std::swap(back_, ready_);
+        hasNew_ = true;
+        cv_.wakeOne();
+    }
+
+    // Blocks until a new frame exists. nullptr = shutting down.
+    // The returned frame stays valid until the next take().
+    const QImage *take()
+    {
+        QMutexLocker l(&m_);
+        while (!hasNew_ && !stop_)
+            cv_.wait(&m_);
+
+        if (stop_)
+            return nullptr;
+
+        std::swap(front_, ready_);
+        hasNew_ = false;
+        return &bufs_[front_];
+    }
+
+    void stop()
+    {
+        QMutexLocker l(&m_);
+        stop_ = true;
+        cv_.wakeAll();
+    }
+
+private:
+    std::array<QImage, 3> bufs_;
+    int  back_ = 0, ready_ = 1, front_ = 2;
+    bool hasNew_ = false;
+    bool stop_   = false;
+    QMutex         m_;
+    QWaitCondition cv_;
+};
+
+// ============================================================================
+// Thread 1: ShmWatcher - sleeps in the kernel until the CAN app publishes.
+//   * every publish is a heartbeat (liveness / staleness detection)
+//   * only real content changes are forwarded to the renderer
+//   * re-attaches automatically if the writer was restarted or the segment
+//     did not exist yet when we started
+// ============================================================================
+
+class ShmWatcher : public QThread
+{
+public:
+    explicit ShmWatcher(LatestState &state) : state_(state) { setObjectName("shm-watch"); }
+
+protected:
+    void run() override
+    {
+        vshm::Reader shm;
+        VehicleData  prev{};
+        bool         havePrev = false;
+        bool         stale    = true;
+        bool         haveSeq  = false;
+        uint32_t     lastSeq  = 0;
+
+        QElapsedTimer sinceBeat;
+        sinceBeat.start();
+
+        auto markStale = [&]()
+        {
+            if (!stale) { stale = true; state_.setStale(true); }
+        };
+
+        while (!isInterruptionRequested())
+        {
+            if (!shm.isOpen())
+            {
+                if (!shm.open())
+                {
+                    markStale();
+                    msleep(500);
+                    continue;
+                }
+                qInfo() << "Vehicle shared memory connected";
+                haveSeq = false;
+                sinceBeat.restart();
+            }
+
+            const uint32_t cur = shm.seq();
+
+            if ((cur & 1u) == 0 && (!haveSeq || cur != lastSeq))
+            {
+                VehicleData d;
+                uint32_t    s = 0;
+
+                if (shm.read(d, s))
+                {
+                    lastSeq = s;
+                    haveSeq = true;
+                    sinceBeat.restart();
+
+                    if (!havePrev || stale || std::memcmp(&d, &prev, sizeof d) != 0)
+                    {
+                        prev     = d;
+                        havePrev = true;
+                        stale    = false;
+                        state_.post(d);
+                    }
+                }
+                continue;
+            }
+
+            // Nothing new: sleep until the writer wakes us (or timeout)
+            shm.waitChange(cur, SHM_WAIT_MS);
+
+            const qint64 quiet = sinceBeat.elapsed();
+            if (quiet > STALE_MS)
+                markStale();
+            if (quiet > REOPEN_MS)
+                shm.release();   // re-open on next iteration
+        }
+    }
+
+private:
+    LatestState &state_;
+};
+
+// ============================================================================
+// Thread 2: RenderThread - wakes only when something visible can change:
+//   new data, needle animation in progress, or the clock minute rolled over.
+// ============================================================================
+
+class RenderThread : public QThread
+{
+public:
+    RenderThread(LatestState &state, FrameExchange &frames)
+        : state_(state), frames_(frames) { setObjectName("render"); }
+
+protected:
+    void run() override
+    {
+        Renderer     renderer;
+        VehicleData  d{};
+        bool         stale  = true;
+        float        shown  = 0.0f;   // smoothed needle position
+        int          lastMinute = -1;
+        bool         first  = true;
+        QElapsedTimer pace;
+
+        for (;;)
+        {
+            pace.start();
+
+            const float before   = stale ? 0.0f : d.speed;
+            const bool  animating = std::fabs(shown - before) > 0.05f;
+
+            const auto w = state_.wait(animating ? 0 : CLOCK_TICK_MS, d, stale);
+            if (w == LatestState::Wake::Stop)
+                break;
+
+            // exponential smoothing: needle glides instead of jumping at 10 Hz
+            const float target = stale ? 0.0f : d.speed;
+            const float prev   = shown;
+            if (std::fabs(target - shown) > 0.05f)
+                shown += (target - shown) * 0.35f;
+            else
+                shown = target;
+
+            const QTime now = QTime::currentTime();
+            const bool  render = first || w == LatestState::Wake::Event ||
+                                 shown != prev || now.minute() != lastMinute;
+
+            if (render)
+            {
+                renderer.render(frames_.back(), d, shown, stale, now);
+                frames_.publish();
+                first      = false;
+                lastMinute = now.minute();
+            }
+
+            // frame-rate cap (only matters while busy; idle waits are longer)
+            const qint64 remaining = FRAME_INTERVAL_MS - pace.elapsed();
+            if (remaining > 0)
+                msleep(static_cast<unsigned long>(remaining));
+        }
+    }
+
+private:
+    LatestState   &state_;
+    FrameExchange &frames_;
+};
+
+// ============================================================================
+// Thread 3: DisplayThread - sole owner of the SPI/GPIO hardware.
+//   Dirty-band algorithm: compare the new frame with what the panel already
+//   shows, in BAND_ROWS-row bands, and transmit only the bands that differ.
+//   A periodic full refresh and automatic re-init make it self-healing.
+// ============================================================================
+
+class DisplayThread : public QThread
+{
+public:
+    DisplayThread(hw::Ili9341 &lcd, FrameExchange &frames)
+        : lcd_(lcd), frames_(frames) { setObjectName("display"); }
+
+protected:
+    void run() override
+    {
+        QByteArray shown(static_cast<int>(FRAME_BYTES), 0);   // what the panel currently shows
+        QElapsedTimer sinceFull;
+        sinceFull.start();
+
+        bool force    = true;
+        int  failures = 0;
+
+        while (const QImage *frame = frames_.take())
+        {
+            if (frame->bytesPerLine() != DISP_W * 2)
+                continue; // cannot happen with Format_RGB16 320 px, but never read out of bounds
+
+            if (sinceFull.elapsed() >= FULL_REFRESH_MS)
+            {
+                force = true;
+                sinceFull.restart();
+            }
+
+            if (pushDirtyBands(*frame, shown, force))
+            {
+                force    = false;
+                failures = 0;
+                continue;
+            }
+
+            // SPI / GPIO error: redo everything, and after repeated failures re-init the panel
+            force = true;
+            if (++failures >= 3)
+            {
+                qWarning() << "Display errors, re-initialising panel";
+                while (!isInterruptionRequested() && !lcd_.reinit())
+                    msleep(500);
+                failures = 0;
+            }
+        }
+    }
+
+private:
+    bool pushDirtyBands(const QImage &frame, QByteArray &shown, bool force)
+    {
+        const uchar *cur = frame.constBits();
+        uchar       *old = reinterpret_cast<uchar *>(shown.data());
+
+        auto differs = [&](int band)
+        {
+            const size_t off = static_cast<size_t>(band) * BAND_BYTES;
+            return force || std::memcmp(cur + off, old + off, BAND_BYTES) != 0;
+        };
+
+        int b = 0;
+        while (b < BANDS)
+        {
+            if (!differs(b)) { ++b; continue; }
+
+            int e = b + 1;                       // merge consecutive dirty bands into one window
+            while (e < BANDS && differs(e))
+                ++e;
+
+            const size_t off = static_cast<size_t>(b) * BAND_BYTES;
+            const size_t len = static_cast<size_t>(e - b) * BAND_BYTES;
+
+            if (!lcd_.writeRows(b * BAND_ROWS, (e - b) * BAND_ROWS,
+                                reinterpret_cast<const uint16_t *>(cur + off)))
+                return false;
+
+            std::memcpy(old + off, cur + off, len);   // remember what is now on the panel
+            b = e;
+        }
+        return true;
+    }
+
+    hw::Ili9341   &lcd_;
+    FrameExchange &frames_;
+};
+
+// ============================================================================
+// Signals -> Qt event loop (async-signal-safe self-pipe)
+// ============================================================================
+
+static int g_sigFd[2] = { -1, -1 };
+
+static void onSignal(int)
+{
+    const int saved = errno;
+    const char c = 1;
+    const ssize_t r = ::write(g_sigFd[1], &c, 1);
+    (void)r;
+    errno = saved;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char *argv[])
+{
+    QGuiApplication app(argc, argv);
+
+    // ---- clean shutdown on Ctrl+C / systemd stop --------------------------
+    if (pipe2(g_sigFd, O_CLOEXEC | O_NONBLOCK) != 0)
+    {
+        perror("pipe2");
+        return 1;
+    }
+
+    struct sigaction sa {};
+    sa.sa_handler = onSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    QSocketNotifier sigNotifier(g_sigFd[0], QSocketNotifier::Read);
+    QObject::connect(&sigNotifier, &QSocketNotifier::activated, &app, [&]()
+    {
+        char buf[16];
+        while (::read(g_sigFd[0], buf, sizeof buf) > 0) {}
+        qInfo() << "Shutdown requested";
+        app.quit();
+    });
+
+    // ---- hardware (fail fast, before any thread exists) -------------------
+    hw::Ili9341 lcd;
+    if (!lcd.begin())
+    {
+        qCritical() << "SPI/display initialisation failed";
+        return 1;
+    }
+
+    // ---- pipeline ---------------------------------------------------------
+    FrameExchange frames;
+    if (frames.back().bytesPerLine() != DISP_W * 2)
+    {
+        qCritical() << "Unexpected frame stride";
+        return 1;
+    }
+
+    LatestState state;
+    ShmWatcher   watcher(state);
+    RenderThread render(state, frames);
+    DisplayThread display(lcd, frames);
+
+    display.start(QThread::HighPriority);   // SPI must never starve
+    render.start(QThread::NormalPriority);
+    watcher.start(QThread::HighPriority);   // wakes instantly on CAN data
+
+    qInfo() << "Dashboard running (Ctrl+C to stop)";
+    const int rc = app.exec();
+
+    // ---- shutdown in data-flow order --------------------------------------
+    watcher.requestInterruption();
+    watcher.wait();
+
+    state.stop();
+    render.wait();
+
+    display.requestInterruption();
+    frames.stop();
+    display.wait();
+
+    return rc;
+}

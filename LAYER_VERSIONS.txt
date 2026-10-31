@@ -1,0 +1,24 @@
+=== .
+remote: https://github.com/yoctoproject/poky.git
+branch: scarthgap
+commit: d4576e3c081a7ee7b57d48421c4c4f491cb4defe
+dirty : 0 changed files
+=== meta (no own .git)
+=== meta-poky (no own .git)
+=== meta-yocto-bsp (no own .git)
+=== meta-raspberrypi
+remote: https://github.com/agherzan/meta-raspberrypi.git
+branch: scarthgap
+commit: 167703d5618498bb7feeaedf18e61be7a8246d1b
+dirty : 0 changed files
+=== meta-rpi-security (no own .git)
+=== meta-openembedded
+remote: https://git.openembedded.org/meta-openembedded
+branch: scarthgap
+commit: ef3df29f2cfca6a9513b51ebcdccf82b6c8a836f
+dirty : 0 changed files
+=== meta-qt5
+remote: https://github.com/meta-qt5/meta-qt5.git
+branch: scarthgap
+commit: 227cf5e7b64c93dfc1a45f235c466db8c3fd8707
+dirty : 0 changed files

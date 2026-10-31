@@ -1,0 +1,23 @@
+[Unit]
+Description=Qt GPIO Demo
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+Wants=can-app.service
+After=can-app.service
+PartOf=can-app.service
+
+[Service]
+Environment=MADCTL_VAL=0x88
+Environment=QT_QPA_PLATFORM=offscreen
+Environment=XDG_RUNTIME_DIR=/run/gpio-qt-demo
+RuntimeDirectory=gpio-qt-demo
+RuntimeDirectoryMode=0700
+Nice=-5
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do [ -c /dev/spidev0.0 ] && [ -e /dev/shm/vehicle_data ] && exit 0; i=$((i+1)); sleep 0.1; done; echo "ERROR: /dev/spidev0.0 or vehicle_data did not appear"; exit 1'
+ExecStart=/usr/bin/gpio-qt-demo
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=sysinit.target
